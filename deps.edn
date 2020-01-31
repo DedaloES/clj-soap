@@ -1,0 +1,13 @@
+{:paths ["src"]
+ :deps
+ {org.clojure/clojure {:mvn/version "1.8.0"}
+  org.clojure/tools.logging {:mvn/version "0.3.1"}
+  org.clojure/data.xml {:mvn/version "0.0.8"}
+  clj-time {:mvn/version "0.12.0"}
+  org.apache.axis2/axis2-adb {:mvn/version "1.7.4"}
+  org.apache.axis2/axis2-transport-http {:mvn/version "1.7.4"}
+  org.apache.axis2/axis2-transport-local {:mvn/version "1.7.4"}
+  org.apache.axis2/axis2-jaxws {:mvn/version "1.7.4"}}
+ :aliases
+ {:dev
+  {:extra-paths ["dev" "test"]}}}
