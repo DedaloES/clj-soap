@@ -1,26 +1,51 @@
 (ns clj-soap.client
   (:require [clojure.tools.logging :as log]
             [clojure.data.xml :as xml]
+            [clojure.data.xml.tree :as xmlt]
             [clj-time.core :as t]
-            [clj-time.format :as f])
+            [clj-time.format :as f]
+            [clojure.data.xml.jvm.pprint :as xmljprn]
+            [clojure.data.xml.jvm.parse :as xmljprs])
   (:import [org.apache.axis2.client ServiceClient
-                                    Options]
+            Options]
            [org.apache.axis2.addressing EndpointReference]
            [org.apache.axis2.transport.http HTTPConstants
-                                            HTTPAuthenticator]
-           [org.apache.axis2.transport.http.impl.httpclient3 HttpTransportPropertiesImpl$Authenticator]
+            HTTPAuthenticator]
+           [org.apache.axis2.transport.http.impl.httpclient3
+            HttpTransportPropertiesImpl$Authenticator]
            [org.apache.axiom.om OMAbstractFactory]
            [org.apache.axis2.description OutOnlyAxisOperation
-                                         AxisService]
+            AxisService]
            [javax.xml.namespace QName]
+           [javax.xml.transform.stream StreamResult]
            [java.net URL
-                     Authenticator
-                     PasswordAuthentication])
-  )
+            Authenticator
+            PasswordAuthentication]
+           [java.io StringWriter Writer]))
 
-(defn axis-service-operations
-  [axis-service]
-  (iterator-seq (.getOperations axis-service)))
+
+(defn axis-indent-xml [om-element ^Writer writer]
+  (.transform (xmljprn/indenting-transformer)
+              (.getSAXSource om-element true)
+              (StreamResult. writer)))
+
+(defn axis-indent-xml-str [om-element]
+  (let [sw (StringWriter.)]
+    (axis-indent-xml om-element sw)
+    (str sw)))
+
+(defn axis-event-seq
+  [sreader opts]
+  (let [props* (merge {:include-node? #{:element :characters}
+                       :coalescing true
+                       :supporting-external-entities false
+                       :location-info true}
+                      opts)]
+    (xmljprs/pull-seq sreader props* nil)))
+
+(defn axis-parse [om-container & {:as opts}]
+  (let [sreader (.getXMLStreamReader om-container)]
+    (xmlt/event-tree (axis-event-seq sreader opts))))
 
 (defn axis-op-name
   [axis-op]
@@ -30,85 +55,114 @@
   [axis-op]
   (.getNamespaceURI (.getName axis-op)))
 
+(defn axis-complex-element? [element]
+  (instance? org.apache.ws.commons.schema.XmlSchemaComplexType
+             (.getSchemaType element)))
+
+(defn axis-simple-element? [element]
+  (instance? org.apache.ws.commons.schema.XmlSchemaSimpleType
+             (.getSchemaType element)))
+
+(defn axis-complex-element-types [schema-element]
+  (->> schema-element
+      .getSchemaType .getParticle .getItems
+      (map (fn [elem]
+             {:name (.getName elem)
+              :type (some-> elem .getSchemaType .getName keyword)
+              :elem elem}))))
+
 (defn axis-op-args
   [axis-op]
-  (for [elem (some-> (first (filter #(= "out" (.getDirection %))
-                                    (iterator-seq (.getMessages axis-op))))
-                     .getSchemaElement .getSchemaType
-                     .getParticle .getItems seq)]
-    {:name (.getName elem)
-     :type (some-> elem .getSchemaType .getName keyword)
-     :elem elem}))
+  (some->> (.getMessages axis-op)
+           iterator-seq
+           (filter #(= "out" (.getDirection %)))
+           first
+           .getSchemaElement
+           axis-complex-element-types))
 
-(defmulti obj->soap-str (fn [obj argtype] argtype))
+(defn axis-op-qname
+  [op argtype]
+  (QName. (axis-op-namespace op) (:name argtype)))
 
-(defmethod obj->soap-str :integer [obj argtype] (str obj))
-(defmethod obj->soap-str :double [obj argtype] (str obj))
-(defmethod obj->soap-str :string [obj argtype] (str obj))
-(defmethod obj->soap-str :boolean [obj argtype] (str obj))
-(defmethod obj->soap-str :default [obj argtype] (str obj))
+(defn axis-service-operations
+  [axis-service]
+  (iterator-seq (.getOperations axis-service)))
 
-(defmulti soap-str->obj (fn [obj argtype] argtype))
-(def multi-parser (f/formatter (t/default-time-zone) "YYYY-MM-dd" "YYYY/MM/dd"))
+(defn axis-service-operation
+  [axis-client key]
+  (let [axis-service (.getAxisService axis-client)
+        op-name (name key)]
+    (->> (axis-service-operations axis-service)
+         (filter #(= op-name (axis-op-name %)))
+         first)))
 
-(defmethod soap-str->obj :long [soap-str argtype] (Long/parseLong soap-str))
-(defmethod soap-str->obj :integer [soap-str argtype] (Integer/parseInt soap-str))
-(defmethod soap-str->obj :double [soap-str argtype] (Double/parseDouble soap-str))
-(defmethod soap-str->obj :string [soap-str argtype] soap-str)
-(defmethod soap-str->obj :boolean [soap-str argtype] (Boolean/parseBoolean soap-str))
-(defmethod soap-str->obj :date [soap-str argtype] (f/parse multi-parser soap-str))
-(defmethod soap-str->obj :default [soap-str argtype] soap-str)
+(defmulti ^{:doc "Build OMElement nodes from data for composing requests"}
+  build-om-element (fn [argtype _ _ _] (:type argtype)))
 
-(defn make-om-elem
-  ([factory tag-name]
-   (.createOMElement
-     factory (javax.xml.namespace.QName. tag-name)))
-  ([factory tag-name value-type value]
-   (doto (.createOMElement
-           factory (javax.xml.namespace.QName. tag-name))
-     (.setText (if (or (nil? value) (nil? value-type))
-                 ; support optional parameters and values without defined types
-                 value
-                 (obj->soap-str value value-type))))))
+(defmethod ^{:doc ""}
+  build-om-element :default [argtype factory parent-qname argval]
+  (let [simple? (axis-simple-element? (:elem argtype))
+        new-qname (if simple?
+                    (QName. (.getNamespaceURI parent-qname)
+                            (:name argtype)
+                            (.getPrefix parent-qname))
+                    (QName. (.getNamespaceURI (.getQName (:elem argtype)))
+                            (:name argtype)))
+        new-element (.createOMElement factory new-qname)]
+    (if simple?
+      (if (not (nil? argval)) (.setText new-element (str argval))
+          (let [xsi-ns (.createOMNamespace factory
+                                           "http://www.w3.org/2001/XMLSchema-instance"
+                                           "xsi")
+                nil-attr (.createOMAttribute factory "nil" xsi-ns "true")]
+            (.addAttribute new-element nil-attr)))
 
-(defn map-obj->om-element
-  [factory op argtype argval]
-  (let [outer-element (make-om-elem factory (:name argtype))]
-    (doseq [[key val] argval]
-      (.addChild outer-element
-                 (make-om-elem factory (name key) (:type argtype) val)))
-    outer-element))
+      ;; Complex type, from now on we assume that argval is a seq
+      (let [component-types (axis-complex-element-types (:elem argtype))]
+        (cond
+          ;; Same size: we match all components and types
+          (= (count component-types) (count argval))
+          (doseq [[cval ctype] (map list argval component-types)]
+            (.addChild new-element (build-om-element ctype factory new-qname cval)))
+
+          ;; Different size, if there is only a component it must be an array
+          (= (count component-types) 1)
+          (let [component-types-list (repeat (count argval) (first component-types))]
+            (doseq [[cval ctype] (map list argval component-types-list)]
+              (.addChild new-element (build-om-element ctype factory new-qname cval))))
+
+          :otherwise
+          (throw (ex-info "Types and arguments mismatch. They should be the same or types count should be 1"
+                          {:types component-types
+                           :argval argval})))
+        ))
+    new-element))
 
 (defn make-request
   [op options & args]
   (let [factory (OMAbstractFactory/getOMFactory)
-        request (.createOMElement
-                  factory (QName. (axis-op-namespace op) (axis-op-name op)))
+        op-qname (QName. (axis-op-namespace op) (axis-op-name op))
+        xsi-ns (.createOMNamespace factory
+                                   "http://www.w3.org/2001/XMLSchema-instance"
+                                   "xsi")
+        request (doto (.createOMElement factory op-qname)
+                  (.declareNamespace xsi-ns))
         op-args (axis-op-args op)]
     (doseq [[argval argtype] (map list args op-args)]
-      (.addChild request
-                 (if (or (nil? (:type argtype)) (:complex-args options false))
-                   (map-obj->om-element factory op argtype argval)
-                   (doto (.createOMElement
-                           factory (javax.xml.namespace.QName. (axis-op-namespace op) (:name argtype)))
-                     (.setText (obj->soap-str argval (:type argtype)))))))
-    (log/trace "Invoking SOAP Operation:" (.getName op) "Request:" request)
+      (.addChild request (build-om-element argtype factory op-qname argval)))
     request))
-
-(defn get-result
-  [retelem]
-  (let [result-xml (str retelem)]
-    (log/trace "SOAP Operation Response:" result-xml)
-    (xml/parse-str result-xml)))
 
 (defn client-call
   [client op options & args]
+  (log/trace "Invoking SOAP Operation:" (.getName op))
   (let [request (apply make-request op options args)]
+    (log/trace " * Request:\n" (axis-indent-xml-str request))
     (locking client
       (if (isa? (class op) OutOnlyAxisOperation)
         (.sendRobust client (.getName op) request)
-        (get-result
-          (.sendReceive client (.getName op) request))))))
+        (let [axis-response (.sendReceive client (.getName op) request)]
+          (log/trace " * Response:\n" (axis-indent-xml-str axis-response))
+          (axis-parse axis-response))))))
 
 (defn client-proxy
   [client options]
@@ -166,5 +220,4 @@
         px (client-proxy client options)]
     (fn [opname & args]
       (when-let [operation (px opname)]
-        (apply operation args)
-        ))))
+        (apply operation args)))))
