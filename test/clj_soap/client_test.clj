@@ -1,13 +1,7 @@
 (ns clj-soap.client-test
-  (:use [clj-soap.client]
-        [clojure.test])
-  )
+  (:require [clj-soap.client :as client]
+            [clojure.test :refer [deftest testing is]]))
 
-(deftest test-client-request
-  (testing "Validate can get weather for Paris"
-    (let [client (client-fn {:wsdl "http://www.webservicex.com/globalweather.asmx?WSDL"})
-          result (client :GetWeather "Paris" "France")]
-      (is (= "Data Not Found" result))
-      )
-    )
-  )
+(deftest client-fn []
+  (testing "Build a client function from a local WSDL resource"
+    (is (client/client-fn {:wsdl "file:test/resources/hello.wsdl" :options {}}))))
