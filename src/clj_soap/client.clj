@@ -110,12 +110,13 @@
                             (:name argtype)))
         new-element (.createOMElement factory new-qname)]
     (if simple?
-      (if (not (nil? argval)) (.setText new-element (str argval))
-          (let [xsi-ns (.createOMNamespace factory
-                                           "http://www.w3.org/2001/XMLSchema-instance"
-                                           "xsi")
-                nil-attr (.createOMAttribute factory "nil" xsi-ns "true")]
-            (.addAttribute new-element nil-attr)))
+      (if (not (nil? argval))
+        (.setText new-element (str argval))
+        (let [xsi-ns (.createOMNamespace factory
+                                         "http://www.w3.org/2001/XMLSchema-instance"
+                                         "xsi")
+              nil-attr (.createOMAttribute factory "nil" xsi-ns "true")]
+          (.addAttribute new-element nil-attr)))
 
       ;; Complex type, from now on we assume that argval is a seq
       (let [component-types (axis-complex-element-types (:elem argtype))]
@@ -123,13 +124,15 @@
           ;; Same size: we match all components and types
           (= (count component-types) (count argval))
           (doseq [[cval ctype] (map list argval component-types)]
-            (.addChild new-element (build-om-element ctype factory new-qname cval)))
+            (when (not= :empty cval)
+              (.addChild new-element (build-om-element ctype factory new-qname cval))))
 
           ;; Different size, if there is only a component it must be an array
           (= (count component-types) 1)
           (let [component-types-list (repeat (count argval) (first component-types))]
             (doseq [[cval ctype] (map list argval component-types-list)]
-              (.addChild new-element (build-om-element ctype factory new-qname cval))))
+              (when (not= :empty cval)
+                (.addChild new-element (build-om-element ctype factory new-qname cval)))))
 
           :otherwise
           (throw (ex-info "Types and arguments mismatch. They should be the same or types count should be 1"
@@ -149,7 +152,8 @@
                   (.declareNamespace xsi-ns))
         op-args (axis-op-args op)]
     (doseq [[argval argtype] (map list args op-args)]
-      (.addChild request (build-om-element argtype factory op-qname argval)))
+      (when (not= :empty argval)
+        (.addChild request (build-om-element argtype factory op-qname argval))))
     request))
 
 (defn client-call
